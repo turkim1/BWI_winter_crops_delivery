@@ -1,0 +1,407 @@
+# Winter Crops Classifier
+
+Classifies agricultural parcels into **Winter crops**, **CZH (rapeseed)** and
+**Other vegetation** from Sentinel-1 (radar) and/or Sentinel-2 (optical)
+time series.
+
+Two interchangeable models:
+
+| Model | When to use | Hardware |
+|---|---|---|
+| `xgboost` (recommended) | default; monthly features | CPU, fast |
+| `inceptiontime` | alternative deep-learning approach | GPU practical, slow on CPU |
+
+---
+
+**Use case:** you have labeled seasons (e.g. 2022–2025) and a newer
+season without labels (e.g. 2026). One command trains on the labeled years
+and writes a prediction for every parcel of the newest year. The season does
+not need to be finished: the months present in the data are used.
+
+**Two workflows, two purposes**
+
+The scripts automatically detect the agricultural years present in the filenames. The newest year is always selected as the prediction year or test year, depending on the script.
+
+* **`python predict.py` — Classify a new season.** Trains on all labeled years except the newest and predicts the crop class of every parcel in the newest year. That year can be incomplete and does not need crop labels.
+* **`python ml_train.py` — Evaluate XGBoost.** Trains on older labeled years and evaluates the model on the newest year, which must have ground-truth labels.
+* **`python it_train.py` — Evaluate InceptionTime.** Uses the same evaluation principle as `ml_train.py`, with the InceptionTime model.
+
+For example, if the data contains labeled seasons from 2020 to 2024 and an unlabeled 2025 season, `predict.py` trains on 2020–2024 and predicts 2025. The evaluation scripts select 2025 as the test year instead, so they cannot calculate meaningful performance metrics without its true labels.
+
+**To evaluate on 2025, remove the 2026 files from `Data/` first.** To classify 2026, keep those files and run `predict.py`.
+
+Reported accuracy, kappa and F1 scores come from evaluation on labeled data. Predictions for an incomplete season may be less accurate because fewer months of observations are available.
+
+
+## Required folder structure
+
+The scripts locate the data relative to `config.py`, so the project must look exactly like this:
+
+```
+project/
+│   config.py
+│   predict.py
+│   ml_train.py
+│   it_train.py
+│   common_preproc.py
+│   indices.py
+│   utils.py
+│   plots.py
+│   ndvi_postfilter.py
+│   ml_dataloader.py
+│   ml_preproc.py
+│   ml_model.py
+│   ml_metrics_logger.py
+│   it_dataloader.py
+│   it_harmonic.py
+│   it_preproc.py
+│   it_model_inception.py
+│   requirements.txt
+│   requirements_it.txt
+│   readme.md
+│
+└───Data/
+    ├───S1_extract_Bapaume/
+    │       S1_Bapaume_2020_2019-09.csv
+    │       S1_Bapaume_2020_2019-10.csv
+    │       ...
+    └───S2_extract_Bapaume/
+            S2_Bapaume_2020_2019-09.csv
+            S2_Bapaume_2020_2019-10.csv
+            ...
+```
+
+Rules:
+- All `.py` files must sit in the same folder, because they import each other.
+- `Data/` must be next to `config.py`, and the sub-folder names must be `S1_extract_<SITE>` and `S2_extract_<SITE>` with `<SITE>` identical to `SITE` in `config.py`.
+- File names must follow `S1_<site>_<agri_year>_<YYYY-MM>.csv` (see section 2.2).
+- `cache_/` and `Runs/` are created automatically. Do not create them by hand.
+
+## 1. Quick start
+
+```bash
+python -m venv venv && venv\Scripts\activate        # Linux/Mac: source venv/bin/activate
+pip install -r requirements.txt
+pip install -r requirements_it.txt                  # only for MODEL_NAME = "inceptiontime"
+```
+Requires **Python 3.11 or 3.12**. For GPU, install `torch` using the command
+on pytorch.org that matches your CUDA version.
+
+1. Put your data in `Data/` (section 2).
+2. Edit `config.py`: `SITE`, `MODEL_NAME`, `SENSOR_MODES` (section 3).
+3. Run:
+```bash
+   python predict.py
+```
+4. Open `Runs/<timestamp>_.../predictions_<year>_<model>_<mode>.csv` (section 4).
+
+The `Data/` folder shipped with this project is a working example, so run
+`python predict.py` once unchanged to check your installation.
+
+---
+
+## 2. Your data
+
+### 2.1 Folder layout
+```
+Data/
+  S1_extract_<SITE>/   S1_<site>_<agri_year>_<YYYY-MM>.csv  ...
+  S2_extract_<SITE>/   S2_<site>_<agri_year>_<YYYY-MM>.csv  ...
+```
+`<SITE>` in the folder names must equal `SITE` in `config.py`.
+You need only the sensors your `SENSOR_MODES` use.
+
+### 2.2 File names
+One file per sensor, per month, per agricultural year:
+```
+S1_Bapaume_2020_2019-09.csv       S2_Bapaume_2023_2023-04.csv
+```
+- the first 4-digit number is the **agricultural year** (the season runs
+  Sep of year-1 to Jun of year; `2023` = Sep 2022 to Jun 2023),
+- the `YYYY-MM` part gives the month (only Sep to Jun are accepted),
+- the site name is free text (underscores allowed).
+
+Anything not matching this pattern stops the run with a validation error.
+
+### 2.3 Columns
+| Sensor | Required columns |
+|---|---|
+| S1 | `id_parcel`, `date`, `VV`, `VH`, `angle`, `code_cultu`, `code_group`; plus `orbit_direction` (`ASCENDING`/`DESCENDING`) for the orbit modes |
+| S2 | `id_parcel`, `date`, `B2 B3 B4 B5 B6 B7 B8 B8A B11 B12`, `MSK_CLDPRB` (0–100), `code_cultu`, `code_group` |
+
+- S1 `VV`/`VH` must be **linear** values, not dB.
+- `code_cultu`/`code_group` are French RPG codes. They are needed in the
+  **labeled years**. In the year to predict they are ignored (they may be
+  absent or blank).
+- A row is one pixel observation of a parcel on one date.
+
+### 2.4 What counts as what
+- **Newest year** found in the files = year to **predict**. It is always
+  treated as unlabeled, even if it contains `code_cultu`.
+- **All other years** = training years. They need labels. Include as many as
+  you have, and each should be a full season.
+- The year to predict may be **partial**. No configuration is needed: see 5.2.
+
+---
+
+## 3. What you can change (`config.py`)
+
+Only edit `config.py`. Settings are grouped by how much care they need.
+
+### 3.1 Always check these
+| Setting | What / why |
+|---|---|
+| `SITE` | Selects `Data/S1_extract_<SITE>` and `S2_extract_<SITE>`. |
+| `MODEL_NAME` | `"xgboost"` or `"inceptiontime"`. |
+| `SENSOR_MODES` | List of sensor combinations; one model and one CSV per entry. Only the data they need is loaded. |
+
+`SENSOR_MODES` values:
+
+| Mode | Uses | Needs |
+|---|---|---|
+| `"S1"` | S1, both orbits merged | S1 files |
+| `"S2"` | S2 | S2 files |
+| `"both"` | S1 + S2 | both |
+| `"S1_ASC"`, `"S1_DESC"` | S1 of one orbit | S1 + `orbit_direction` |
+| `"S1_SPLIT_ORBIT"` | S1 ascending and descending as separate features | S1 + `orbit_direction` |
+| `"both_split_orbit"` | S1 split by orbit + S2 | both + `orbit_direction` |
+
+A mode that needs data you don't have stops immediately with a clear message.
+
+### 3.2 Crop definitions (change for a non-French registry)
+| Setting | Meaning |
+|---|---|
+| `WINTER_CROPS` | `code_cultu` values labelled class 0 |
+| `CZH_CROPS` | `code_cultu` values labelled class 1 (rapeseed) |
+| everything else | class 2, Other vegetation |
+| `EXCLUDED_CODE_GROUPS` | `code_group` values dropped entirely (vines, orchards, misc., fallow) |
+
+A wrong mapping does not raise an error. It silently gives almost all
+"Other vegetation". Always check the **class distribution** printed in the
+log on the first run.
+
+### 3.3 Post-classification NDVI split (does not change predictions)
+| Setting | Default | Why |
+|---|---|---|
+| `NDVI_POSTFILTER` | `True` | Adds `veg_subclass` to the CSV. Needs S2 files for the predict year. |
+| `NDVI_FILTER_START_MONTH` / `END_MONTH` | `m02` / `m05` | Window in which cultivated land should be green. Starting in February avoids cover crops. |
+| `NDVI_FILTER_THRESHOLD` | `0.45` | A parcel predicted "Other vegetation" with max monthly NDVI above this is `cultivated`, otherwise `non_cultivated`. |
+
+### 3.4 Preprocessing (changes results; caches rebuild automatically)
+These defaults produced the reported results. Change them only deliberately.
+
+| Setting | Default | Effect |
+|---|---|---|
+| `CLOUD_THRESHOLD` | `1` | Keeps S2 rows with `MSK_CLDPRB` ≤ this. `1` = very clean but sparse. Raising gives more observations, noisier. |
+| `S1_SPIKE_FILTER`, `S1_SPIKE_THRESHOLD_DB` | `True`, `5.0` | Removes an S1 acquisition that jumps more than this (dB) against both neighbours. |
+| `S2_NDVI_DIP_FILTER`, `S2_NDVI_DIP_THRESHOLD` | `True`, `0.4` | Removes S2 acquisitions with a sudden NDVI dip on both sides (undetected clouds). |
+| `REF_ANGLE` | `None` | Reference incidence angle for S1 normalisation. `None` = computed from training years. |
+| `S2_MODE` | `"bands"` | S2 features: `"bands"` (raw B2–B12), `"indices"` (NDVI, NDMI, NDRE, PSRI, NDYI), `"bands_10m"`, `"bands_10m+indices"`. |
+
+### 3.5 Model hyperparameters
+| Setting | Notes |
+|---|---|
+| `BEST_PARAMS_XGB` | XGBoost parameters. Keep `objective: "multi:softprob"`: the confidence columns need it. |
+| `RANDOM_SEED` | Reproducibility. |
+| `IT_HARMONIC_STEP_DAYS` (6), `IT_HARMONIC_N_PER_SEASON` (4) | InceptionTime time grid and harmonic order. A fit needs at least `2×order+2` valid observations, so a higher order leaves more parcels unclassified. |
+| `IT_NB_FILTERS`, `IT_DEPTH`, `IT_KERNEL_SIZES`, `IT_BOTTLENECK_DIM` | Architecture. |
+| `IT_N_EPOCHS`, `IT_BATCH_SIZE`, `IT_LR`, `IT_WEIGHT_DECAY`, `IT_EARLY_STOPPING_*`, `IT_LR_*` | Training. |
+
+### 3.6 Do not change without editing code
+| Setting | Why |
+|---|---|
+| `CLASS_NAMES` / number of classes | Class ids 0/1/2 are also hard-coded in `common_preproc.assign_class`, `ndvi_postfilter.py` and `plots.py`. |
+| `MONTH_ORDER` | Season definition (Sep to Jun) used throughout. |
+| `S1_NUMERIC_COLS` | The ML branch assumes `"angle"` is the last entry. |
+| `AGG_FUNCS` | Only `["median"]` was used and tested. |
+
+### 3.7 Caches and outputs
+- `cache_/` holds intermediate data. It is keyed on the data files and the
+  settings above, so it rebuilds by itself when you add a month file or change
+  a setting. **If you edit the Python code in `common_preproc.py`, delete
+  `cache_/`.**
+- Every run writes to a new `Runs/<timestamp>_<model>_<site>_...` folder.
+
+---
+
+## 4. Running and reading the result
+
+```bash
+python predict.py
+```
+Output, one CSV per sensor mode:
+`Runs/<run>/predictions_<year>_<model>_<mode>.csv`, with **one row per parcel
+found in the predict-year files**.
+
+| Column | Meaning |
+|---|---|
+| `id_parcel`, `agri_year` | Parcel and predicted year |
+| `classified` | `True` if a prediction was made |
+| `reason` | Why not, when `classified` is `False` |
+| `pred_class` / `pred_name` | 0/1/2 and Winter crops / CZH / Other vegetation |
+| `confidence` | Highest class probability. A model score, not a measured accuracy. |
+| `proba_winter_crops`, `proba_czh`, `proba_other_vegetation` | Class probabilities |
+| `window_s1`, `window_s2`, `n_valid_months_s1`, `n_valid_months_s2` | **xgboost:** months used, and months with real data for this parcel |
+| `window`, `n_valid_obs_<block>` | **inceptiontime:** season window used, and real acquisitions per sensor block (e.g. `n_valid_obs_s2`) |
+| `veg_subclass`, `ndvi_max_window`, `ndvi_max_month` | NDVI split (if enabled): `winter_cereal`, `rapeseed`, `cultivated`, `non_cultivated`, `unknown` (no NDVI), `unclassified` |
+
+
+```mermaid
+flowchart TD
+    S["A row in the CSV"] --> Q1{"classified = True?"}
+    Q1 -- "No" --> R["Read the reason column<br/>no prediction was possible"]
+    Q1 -- "Yes" --> Q2{"n_valid_months or<br/>n_valid_obs is high?"}
+    Q2 -- "No" --> W["Weak evidence<br/>mostly filled data, use with care"]
+    Q2 -- "Yes" --> Q3{"pred_class = 2<br/>Other vegetation?"}
+    Q3 -- "No" --> OK["Winter crops or CZH<br/>use pred_name"]
+    Q3 -- "Yes" --> Q4{"veg_subclass"}
+    Q4 --> C1["cultivated<br/>max NDVI Feb-May above 0.45"]
+    Q4 --> C2["non_cultivated<br/>max NDVI 0.45 or below"]
+    Q4 --> C3["unknown<br/>no usable NDVI, less reliable"]
+
+    classDef bad fill:#FCEBEB,stroke:#A32D2D,color:#501313
+    classDef warn fill:#FAEEDA,stroke:#854F0B,color:#412402
+    classDef good fill:#E1F5EE,stroke:#0F6E56,color:#04342C
+    class R bad
+    class W,C3 warn
+    class OK,C1,C2 good
+```
+
+**Reading it:** a low `n_valid_months_*` or `n_valid_obs_*` means the
+prediction rests on little real data (the rest is filled, see 5.3). Filter on
+these columns if you need more certainty.
+
+When is a parcel `classified = False`?
+- **xgboost:** only if a required sensor has no real month at all.
+- **inceptiontime:** if any sensor block has fewer than `2×order+2` (10 by default)
+  valid observations in the window. This is stricter. Such parcels are also
+  excluded from training.
+
+The coverage (`X% classified`) is printed at the end of each mode.
+
+### Reproducing the report metrics (optional)
+```bash
+python ml_train.py   # xgboost   (requires MODEL_NAME = "xgboost")
+python it_train.py   # inceptiontime
+```
+Each trains on all labeled years except the newest and tests on the newest
+(which must therefore be **labeled**). If `Data/` also holds an unlabeled
+year to predict, **move that year's files out first**, otherwise the
+evaluation will fail or give meaningless metrics. Outputs are in
+`Runs/<run>/`: `trial_metrics.csv` (accuracy, kappa, F1 per class),
+confusion matrices, plots, the saved model and `predictions_<year>.csv`
+(`y_true`, `y_pred`). For leave-one-year-out with XGBoost, set
+`main(single=False)` at the bottom of `ml_train.py`.
+
+Accuracies of the delivered method come from the project report; `predict.py`
+does not compute any (there are no labels for the predicted year).
+Note that `it_train.py` keeps the report's handling of sparse parcels (median
+fill), whereas `predict.py` excludes them, so their InceptionTime numbers are
+not directly comparable.
+
+---
+
+## 5. How it works
+
+### 5.1 Preprocessing (shared, `common_preproc.py`)
+Per monthly file: S2 cloud filter, orbit filter (orbit modes), exclusion of
+`EXCLUDED_CODE_GROUPS`, S1 incidence-angle normalisation
+(`σ·cos²θref / cos²θ`) or S2 NDVI/indices, spike or NDVI-dip removal,
+labelling, then one row per (parcel, date) by taking the median.
+
+### 5.2 Early-season prediction
+Nothing to configure. The months that actually contain data in the newest
+year define the window, and the model is trained on exactly those months for
+every training year.
+- **xgboost:** a month column is used if any parcel has data in the predict
+  year. Each sensor keeps its own months.
+- **inceptiontime:** observations after the last month with data are dropped
+  for all years, and the time grid ends there. With two sensors, the shorter
+  window applies to both.
+- A month that exists as a file but has no usable observations (e.g. all
+  cloudy) counts as missing. A month with only a few acquisitions is used as is.
+
+### 5.3 Missing data
+- **xgboost:** per parcel, empty months are filled by linear interpolation
+  between the nearest real months, and the nearest real value is repeated at
+  the ends. This is done after the window is chosen, so months beyond the window
+  never influence a value. Anything still missing gets the training median.
+- **inceptiontime:** a harmonic curve is fitted to each parcel's real
+  observations and sampled every 6 days. Parcels that cannot be fitted are not
+  filled with an average curve; they are left unclassified.
+
+### 5.4 Models
+- **xgboost:** monthly median per feature, wide table, standardised,
+  balanced sample weights.
+- **inceptiontime:** 1D CNN with inception blocks; per-timestep
+  standardisation, class-weighted loss, random 20% validation split for early
+  stopping.
+
+---
+
+## 6. File by file
+
+**Entry points**
+| File | Role |
+|---|---|
+| `predict.py` | Main workflow: checks config against data, builds features, trains, predicts the newest year, writes the CSV, applies the NDVI split. |
+| `ml_train.py` | Evaluation for XGBoost (train on older years, test on the newest). |
+| `it_train.py` | Evaluation for InceptionTime. |
+
+**Configuration and shared code**
+| File | Role |
+|---|---|
+| `config.py` | All settings (section 3). |
+| `utils.py` | File-name parsing, year detection, input validation, `required_data` (which sensors the modes need), dB conversion. |
+| `common_preproc.py` | Per-file loading and filtering for both models (5.1). Changes here affect both. |
+| `indices.py` | Computes NDVI, NDMI, NDRE, PSRI, NDYI from S2 bands. |
+
+**XGBoost branch**
+| File | Role |
+|---|---|
+| `ml_dataloader.py` | Builds and caches the wide monthly table; chooses columns per sensor mode. |
+| `ml_preproc.py` | Monthly aggregation, wide pivot, window selection, valid-month counting, interpolation. |
+| `ml_model.py` | Classifier creation, training, evaluation plots. |
+| `ml_metrics_logger.py` | Appends metrics to `trial_metrics.csv`. |
+
+**InceptionTime branch**
+| File | Role |
+|---|---|
+| `it_dataloader.py` | Caches per-sensor long tables; builds harmonic tensors for the evaluation script. |
+| `it_harmonic.py` | Harmonic fit, resampling to the grid, season cut-off. |
+| `it_preproc.py` | S1 channel names and sensor helper. |
+| `it_model_inception.py` | Network, training loop, evaluation and the predict-time fit. |
+
+**Other**
+| File | Role |
+|---|---|
+| `ndvi_postfilter.py` | NDVI-based `veg_subclass` (3.3). |
+| `plots.py` | Diagnostic plots used by the evaluation scripts. |
+
+---
+
+## 7. Known limitations
+
+- Crop registry is French RPG (3.2).
+- In the predict year, vines, orchards and other excluded groups cannot be
+  filtered (there is no declaration), so they come out as "Other vegetation".
+- Parcels can change crop between years, so the same parcel appearing in
+  train and predict years is normal.
+- `confidence` is not a calibrated accuracy.
+- The NDVI split only runs if S2 files exist for the predict year and the
+  window's start month is available.
+- The training years must contain all three classes.
+
+## 8. Troubleshooting
+
+| Message / symptom | Cause and fix |
+|---|---|
+| `File validation failed` | File names or months do not match 2.2. |
+| `Mode 'X' needs S2 but there are no S2 files for <year>` | The newest year has no S2 files: use an S1 mode, or add the S2 files. |
+| `needs an 'orbit_direction' column` | Use a non-orbit mode (`S1`, `S2`, `both`). |
+| Nearly everything is "Other vegetation" | Crop codes do not match 3.2. |
+| `No labeled training parcels found` | Training years lack `code_cultu`. |
+| `Training data must contain all classes` | One class is absent after filtering (InceptionTime). |
+| Evaluation script crashes or shows odd metrics | An unlabeled year is in `Data/`; move it out (section 4). |
+| Results ignore a code change | Delete `cache_/` (3.7). |
+| `ndvi_filter: not possible` | No S2 data for the predict year, or the season has not reached `NDVI_FILTER_START_MONTH`. |
